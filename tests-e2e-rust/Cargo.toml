@@ -95,6 +95,17 @@ compact-contract-schnorr-attest-fixture = { path = "contracts/schnorr-attest-fix
 # truncate (`wrapping_*` does not panic), so the mbits->rust-width ladder is
 # pinned by arithmetic rather than only by the generated text.
 compact-contract-widening-arith-fixture = { path = "contracts/widening-arith-fixture" }
+# Mixed-minimal-width operand gate: mixed_width_operand_fixture.rs drives
+# every comparison operator, the mixed-width `+ - *`, the guarded
+# subtraction, and the impure inline equality with values whose product
+# crosses 2^32, so a truncating or wrongly-directed widening cast cannot
+# pass by merely compiling.
+compact-contract-mixed-width-operand-fixture = { path = "contracts/mixed-width-operand-fixture" }
+# Type-directed coercion gate: literal_coercion.rs drives every position a
+# bare literal / Uint value can occupy (const RHS, struct member, some/native
+# argument, vector element, return tail, scalar and wide Uint→Field, ledger
+# write) and byte-compares the constructor's seeded state against TS.
+compact-contract-literal-coercion-fixture = { path = "contracts/literal-coercion-fixture" }
 # Registered in codegen_regression's FIXTURES table, so it MUST carry a
 # dev-dependency edge too: workspace membership alone does not make
 # `cargo build -p tests-e2e-rust --tests` compile it. The invariant test

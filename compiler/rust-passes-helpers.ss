@@ -25,8 +25,76 @@
 ;;; Included first, so everything here is in scope for every other file.
 ;;; See compiler/README-rust-passes.md for the module map.
 
+      ;; current-rust-output: reverse-accumulated `lib.rs` fragments. `out`
+      ;; buffers rather than writing straight through so the whole text can be
+      ;; scanned for a spliced sentinel BEFORE it reaches the output port
+      ;; (task 4.1). `flush-rust-output!` is called once at the end of
+      ;; print-rust's Program clause; a sentinel hit raises a located
+      ;; `rust-feature-error` and the target-port exception handler deletes the
+      ;; (still-empty) file, so a broken render never leaves a lib.rs behind.
+      (define current-rust-output
+        (make-parameter '()))
+
       (define (out s)
-        (display-string s (get-target-port 'contract.rs)))
+        (current-rust-output (cons s (current-rust-output))))
+
+      ;; rust-false-sentinel-index: the index of a spliced `#f` token in `s`,
+      ;; or #f. The Scheme `#f` reaches the output only when a renderer that
+      ;; could not lower an expression has its `#f` fed to `format`/string
+      ;; concatenation by an unchecked caller — the silent-bad-output failure
+      ;; this guard exists to stop. A `#f` that is part of a Rust string/char
+      ;; literal or a comment is ignored, as is a raw identifier (`r#foo`,
+      ;; which the emitter produces for keyword-named enum variants), so only
+      ;; an actual spliced token is flagged.
+      (define (rust-false-sentinel-index s)
+        (let ([n (string-length s)])
+          (define (id-char? c)
+            (or (char-alphabetic? c) (char-numeric? c) (char=? c #\_)))
+          (define (at2? i a b)
+            (and (fx<= (fx+ i 2) n)
+                 (char=? (string-ref s i) a)
+                 (char=? (string-ref s (fx+ i 1)) b)))
+          (let loop ([i 0] [in-str? #f] [in-line-comment? #f] [block-depth 0])
+            (cond
+              [(fx>= i n) #f]
+              [in-line-comment?
+               (if (char=? (string-ref s i) #\newline)
+                   (loop (fx+ i 1) #f #f 0)
+                   (loop (fx+ i 1) #f #t 0))]
+              [(fx> block-depth 0)
+               (cond
+                 [(at2? i #\* #\/) (loop (fx+ i 2) #f #f (fx- block-depth 1))]
+                 [(at2? i #\/ #\*) (loop (fx+ i 2) #f #f (fx+ block-depth 1))]
+                 [else (loop (fx+ i 1) #f #f block-depth)])]
+              [in-str?
+               (cond
+                 [(char=? (string-ref s i) #\\) (loop (fx+ i 2) #t #f 0)]
+                 [(char=? (string-ref s i) #\") (loop (fx+ i 1) #f #f 0)]
+                 [else (loop (fx+ i 1) #t #f 0)])]
+              [(char=? (string-ref s i) #\") (loop (fx+ i 1) #t #f 0)]
+              [(at2? i #\/ #\/) (loop (fx+ i 2) #f #t 0)]
+              [(at2? i #\/ #\*) (loop (fx+ i 2) #f #f 1)]
+              [(and (char=? (string-ref s i) #\#)
+                    (fx< (fx+ i 1) n)
+                    (char=? (string-ref s (fx+ i 1)) #\f)
+                    (or (fx= i 0)
+                        (not (id-char? (string-ref s (fx- i 1)))))
+                    (or (fx= (fx+ i 2) n)
+                        (not (id-char? (string-ref s (fx+ i 2))))))
+               i]
+              [else (loop (fx+ i 1) #f #f 0)]))))
+
+      ;; flush-rust-output!: scan the buffered lib.rs for a spliced sentinel
+      ;; and either refuse (located at `src`) or write it out. Called once,
+      ;; after every `out`.
+      (define (flush-rust-output! src)
+        (let ([text (apply string-append (reverse (current-rust-output)))])
+          (let ([i (rust-false-sentinel-index text)])
+            (when i
+              (rust-feature-error src 'sentinel-splice
+                "an expression reached a position the renderer could not lower; refused rather than emit a `#f` sentinel (near byte ~a)"
+                i)))
+          (display-string text (get-target-port 'contract.rs))))
 
       ;; rust-feature-error: raises a compactc error tagged with the
       ;; `--target rust:` prefix when the codegen hits an unsupported Compact
@@ -310,6 +378,26 @@
       (define current-arith-suffix
         (make-parameter #f))
 
+      ;; current-expr-expected-type: the Compact Type that the expression
+      ;; currently being rendered must produce, or #f when no use position
+      ;; has declared one. Set by `expr-rust-typed` (and the constructor
+      ;; walker's typed entry) so the renderers can materialise the
+      ;; `safe-cast` the typechecker already inserted at every consequential
+      ;; position, instead of discarding it. The default #f keeps the
+      ;; no-expectation path byte-identical: every consult site only acts
+      ;; when this is non-#f, so a boundary that has not opted in renders
+      ;; exactly as before. See `materialize-at-type` below.
+      (define current-expr-expected-type
+        (make-parameter #f))
+
+      ;; current-pure-return-type: the declared return Type of the pure
+      ;; circuit whose body is being emitted, or #f outside a pure-circuit
+      ;; body. The pure statement walker consults it in tail position so a
+      ;; statement-lifted return tail (e.g. `return 0;` in a Field circuit)
+      ;; materialises the typer's return-type `safe-cast` (task 2.2).
+      (define current-pure-return-type
+        (make-parameter #f))
+
       ;; A25: ctor-zswap-threaded? — set #t (within emit-ctor-body-or-fallback's
       ;; dynamic extent) once a constructor has threaded an impure-circuit call
       ;; through a local `_zswap` binding. impure-call-thread-lines flips it on
@@ -514,6 +602,280 @@
       (define (uint-byte-length-matches-rust-width? nat)
         (let ([bl (uint-byte-length nat)])
           (or (= bl 1) (= bl 2) (= bl 4) (= bl 8) (= bl 16))))
+
+      ;; -----------------------------------------------------------------
+      ;; Type-directed coercion (the single decision point).
+      ;;
+      ;; The typechecker already computes every coercion the language
+      ;; requires and records it as a `(safe-cast <target> <src> expr)`
+      ;; wrapper. `materialize-at-type` is the one place that turns an
+      ;; expression plus an expected Compact type into correctly-typed Rust;
+      ;; it returns #f when the un-ascribed rendering is already correct, so
+      ;; neutral sites stay byte-identical. See the change design at
+      ;; openspec/changes/type-directed-expression-coercion/.
+      ;; -----------------------------------------------------------------
+
+      ;; type-strip-alias: peel `talias` layers, returning the underlying
+      ;; structural Type. The coercion decision recurses into aggregate
+      ;; shapes (Vector<N, T>, tuples, and their nesting), so it needs
+      ;; structural access rather than the scalar-only `type-is-tfield?`.
+      (define (type-strip-alias type)
+        (nanopass-case (Ltypescript Type) type
+          [(talias ,src ,nominal? ,type-name ,type^) (type-strip-alias type^)]
+          [else type]))
+
+      ;; type-elt-types: when `type` is an aggregate of length `n` — a
+      ;; `(tvector n T)` or a `(ttuple T ...)`, possibly reached through a
+      ;; `talias` — return its element types in order; #f otherwise
+      ;; (including a length mismatch). Bridges the IR's two aggregate
+      ;; spellings: a `Vector<n, T>` target routinely arrives with a
+      ;; `ttuple` source (the typer's element-wise join).
+      (define (type-elt-types t n)
+        (nanopass-case (Ltypescript Type) (type-strip-alias t)
+          [(tvector ,src ,len ,type) (and (= len n) (make-list n type))]
+          [(ttuple ,src ,type* ...) (and (= (length type*) n) type*)]
+          [else #f]))
+
+      ;; uint-coercion-cast-width: the Rust primitive that losslessly holds
+      ;; every value of a `(tunsigned nat)` — "u64" through 2^64-1 (kept for
+      ;; byte parity with the original scalar path), "u128" through 2^128-1,
+      ;; #f above u128::MAX. `Uint<N>` stores its inclusive max
+      ;; (`Uint<128>` -> 2^128-1), so the u128 rung covers every legal
+      ;; Compact width: `impl From<u128> for Fr` exists upstream and the
+      ;; field modulus is ~2^255, so `as u128` is a lossless zero-extension.
+      (define (uint-coercion-cast-width nat)
+        (cond
+          [(<= nat 18446744073709551615) "u64"]
+          [(<= nat 340282366920938463463374607431768211455) "u128"]
+          [else #f]))
+
+      ;; join-rendered: comma-separate rendered parts into a Rust array body.
+      (define (join-rendered parts)
+        (let loop ([xs parts] [acc ""])
+          (cond
+            [(null? xs) acc]
+            [(null? (cdr xs)) (string-append acc (car xs))]
+            [else (loop (cdr xs) (string-append acc (car xs) ", "))])))
+
+      ;; field-uint-scalar: render a Uint->Field scalar coercion from an
+      ;; already-rendered inner value (`inner-text`). The value is cast to
+      ;; the width that losslessly holds the source range, then wrapped in
+      ;; `Fr::from`. A range above u128::MAX has no lossless Rust cast and is
+      ;; refused loudly rather than emitted as a bare (wrong-width) Uint.
+      (define (field-uint-scalar src nat inner-text)
+        (let ([w (uint-coercion-cast-width nat)])
+          (if w
+              (format "Fr::from((~a) as ~a)" inner-text w)
+              (rust-feature-error src 'field-uint-coercion
+                "a Uint source range up to ~a has no lossless coercion to Field (exceeds u128)"
+                nat))))
+
+      ;; field-literal-rust: render a compile-time Field literal `n` (a
+      ;; non-negative exact integer) as a Rust `Fr` value. The lexer bounds
+      ;; every numeric literal to `max-field` and Field arithmetic folds
+      ;; modulo `max-field + 1`, so `n` is always a canonical field element.
+      ;;
+      ;; Small values go through the runtime's `u64` / `u128` `From` impls;
+      ;; the `u64` rung keeps the pre-existing `Fr::from(<n>u64)` bytes for
+      ;; the common small-literal case, so neutral output stays
+      ;; byte-identical. A Field literal above `u128::MAX` (legal — `max-field`
+      ;; is a ~2^255 value, well above `u128::MAX`) is rendered from its
+      ;; little-endian bytes via `Fr::from_le_bytes`, whose canonical-range
+      ;; check always succeeds for a lexer-admitted literal. Picking the
+      ;; width from the Field domain — rather than a fixed `u64` — is what
+      ;; stops `Fr::from(<n>u64)` from overflowing `u64` and failing
+      ;; `cargo build` while `compactc` exits 0.
+      (define (field-literal-rust n)
+        (cond
+          [(<= n 18446744073709551615) (format "Fr::from(~au64)" n)]
+          [(<= n 340282366920938463463374607431768211455)
+           (format "Fr::from(~au128)" n)]
+          [else
+           (format "Fr::from_le_bytes(&[~a]).expect(\"Field literal is canonical\")"
+             (join-rendered
+               (map (lambda (b)
+                      (let ([s (number->string b 16)])
+                        (format "0x~a"
+                          (if (fx= (string-length s) 1)
+                              (string-append "0" s)
+                              s))))
+                 (let loop ([n n] [i 0] [acc '()])
+                   (if (fx= i 32)
+                       (reverse acc)
+                       (loop (ash n -8) (fx+ i 1)
+                             (cons (bitwise-and n #xff) acc)))))))]))
+
+      ;; render-inner-at: bind `expected` as the current expected type and
+      ;; render a sub-expression. `materialize-at-type` owns the expected type
+      ;; around every inner render: a scalar inner is rendered at its SOURCE
+      ;; type (so any nested wrapper at that level still materialises), an
+      ;; aggregate element at the ELEMENT type, and a bound aggregate value
+      ;; with no expected type (it is coerced by index afterwards). The thunks
+      ;; the callers pass are the raw renderers (`expr-rust` /
+      ;; `ctor-expr-rust`); they never bind the parameter themselves.
+      (define (render-inner-at expected render-inner expr)
+        (parameterize ([current-expr-expected-type expected])
+          (render-inner expr)))
+
+      ;; materialize-scalar: the scalar coercion decision for `expr` of
+      ;; `source-type` into `target-type`, with `render-inner` producing the
+      ;; un-ascribed inner rendering. Returns the coerced Rust text, or #f
+      ;; when no coercion is needed (same type / same Rust width / a literal
+      ;; Rust can infer).
+      (define (materialize-scalar src target-type source-type expr render-inner)
+        (nanopass-case (Ltypescript Type) (type-strip-alias target-type)
+          [(tfield ,src^)
+           (let ([lit (literal-int-expr? expr)])
+             (cond
+               [lit (field-literal-rust lit)]
+               [else
+                (let ([nat (type-peel-tunsigned source-type)])
+                  (and nat
+                       (field-uint-scalar src nat
+                         (render-inner-at source-type render-inner expr))))]))]
+          [(tunsigned ,src^ ,nat)
+           (let ([lit (literal-int-expr? expr)])
+             (cond
+               [lit (format "~a~a" lit (uint-rust-width nat))]
+               [else
+                (let ([nat-s (type-peel-tunsigned source-type)])
+                  (and nat-s
+                       (let ([wt (uint-rust-width nat)]
+                             [ws (uint-rust-width nat-s)])
+                         (and (not (equal? wt ws))
+                              (format "((~a) as ~a)"
+                                      (render-inner-at source-type render-inner expr)
+                                      wt)))))]))]
+          [else #f]))
+
+      ;; materialize-element: coerce one aggregate element (a Tuple-Argument)
+      ;; from `source-elt` to `target-elt`. A nested aggregate recurses; a
+      ;; scalar materialises; an element that needs no conversion renders at
+      ;; its own element type through `render-inner` so any wrapper already on
+      ;; it still materialises.
+      (define (materialize-element src target-elt source-elt tuple-arg render-inner)
+        (nanopass-case (Ltypescript Tuple-Argument) tuple-arg
+          [(single ,src^ ,expr)
+           (or (materialize-at-type src^ target-elt source-elt expr render-inner)
+               (render-inner-at target-elt render-inner expr))]
+          [(spread ,src^ ,nat ,expr)
+           (rust-feature-error src^ 'tuple-spread
+             "tuple spread (`...expr`) not supported")]))
+
+      ;; materialize-indexed-text: build the Rust array literal that coerces an
+      ;; aggregate value already bound to `base-text` (a temp name) element by
+      ;; element. Indexing recurses, so nested aggregates are coerced at every
+      ;; depth. Returns #f when no element needs coercing.
+      (define (materialize-indexed-text src target-elt* source-elt* base-text)
+        (if (not (ormap (lambda (te se) (materialize-needed? te se))
+                        target-elt* source-elt*))
+            #f
+            (string-append
+              "["
+              (join-rendered
+                (let loop ([i 0] [te* target-elt*] [se* source-elt*] [acc '()])
+                  (if (null? te*)
+                      (reverse acc)
+                      (let ([access (format "~a[~a]" base-text i)])
+                        (loop (+ i 1) (cdr te*) (cdr se*)
+                              (cons (or (materialize-at-type-text src (car te*) (car se*) access)
+                                        access)
+                                    acc))))))
+              "]")))
+
+      ;; materialize-at-type-text: coerce an already-rendered Rust value
+      ;; (`base-text`) of `source-type` into `target-type`, returning the
+      ;; coerced text or #f when no conversion is needed. Used for aggregate
+      ;; values whose element boundaries are not syntactically visible (a
+      ;; `default`, a var-ref, a seq-lifted const): the value is bound once
+      ;; and coerced by index.
+      (define (materialize-at-type-text src target-type source-type base-text)
+        (nanopass-case (Ltypescript Type) (type-strip-alias target-type)
+          [(tfield ,src^)
+           (let ([nat (type-peel-tunsigned source-type)])
+             (and nat (field-uint-scalar src nat base-text)))]
+          [(tunsigned ,src^ ,nat)
+           (let ([nat-s (type-peel-tunsigned source-type)])
+             (and nat-s
+                  (let ([wt (uint-rust-width nat)]
+                        [ws (uint-rust-width nat-s)])
+                    (and (not (equal? wt ws))
+                         (format "((~a) as ~a)" base-text wt)))))]
+          [(tvector ,src^ ,len ,type)
+           (let ([se* (type-elt-types source-type len)])
+             (and se* (materialize-indexed-text src (make-list len type) se* base-text)))]
+          [(ttuple ,src^ ,type* ...)
+           (let ([se* (type-elt-types source-type (length type*))])
+             (and se* (materialize-indexed-text src type* se* base-text)))]
+          [else #f]))
+
+      ;; materialize-needed?: type-level predicate — would coercing a value of
+      ;; `source-type` into `target-type` change its Rust rendering? Delegates
+      ;; to the text renderer with a placeholder base, so the predicate and the
+      ;; renderer cannot drift.
+      (define (materialize-needed? target-type source-type)
+        (materialize-at-type-text #f target-type source-type "__materialize_probe"))
+
+      ;; materialize-aggregate: render an aggregate coercion. A `(tuple ...)`
+      ;; literal is decomposed syntactically, so each element's own expression
+      ;; (and any wrapper already on it) is preserved. Any OTHER aggregate
+      ;; value — a `default`, a var-ref, a seq-lifted const — has no syntactic
+      ;; element boundaries, so it is bound once to a temp and coerced by
+      ;; index (`materialize-indexed-text`). Returns #f when no element needs
+      ;; coercing.
+      (define (materialize-aggregate src target-elt* source-elt* expr render-inner)
+        (if (not (ormap (lambda (te se) (materialize-needed? te se))
+                        target-elt* source-elt*))
+            #f
+            (nanopass-case (Ltypescript Expression) expr
+              [(tuple ,src^ ,tuple-arg* ...)
+               (if (= (length tuple-arg*) (length target-elt*))
+                   (string-append
+                     "["
+                     (join-rendered
+                       (map (lambda (ta te se)
+                              (materialize-element src te se ta render-inner))
+                            tuple-arg* target-elt* source-elt*))
+                     "]")
+                   (rust-feature-error src 'field-uint-coercion
+                     "aggregate coercion arity mismatch"))]
+              [else
+               (let ([tmp "__compact_materialize"])
+                 (format "{ let ~a = ~a; ~a }"
+                         tmp (render-inner-at #f render-inner expr)
+                         (materialize-indexed-text src target-elt* source-elt* tmp)))])))
+
+      ;; materialize-at-type: the single type-directed coercion decision.
+      ;; Render `expr` (an Expression) of `source-type` at `target-type`, with
+      ;; `render-inner` the raw renderer of a sub-expression. Returns the
+      ;; coerced Rust text, or #f when the inner rendering is already correct
+      ;; so the caller falls back to it and byte parity holds. The expected
+      ;; type around every inner render is bound here (see render-inner-at),
+      ;; so the caller's thunk must not bind it.
+      (define (materialize-at-type src target-type source-type expr render-inner)
+        (nanopass-case (Ltypescript Type) (type-strip-alias target-type)
+          [(tvector ,src^ ,len ,type)
+           (let ([se* (type-elt-types source-type len)])
+             (and se* (materialize-aggregate src (make-list len type) se* expr render-inner)))]
+          [(ttuple ,src^ ,type* ...)
+           (let ([se* (type-elt-types source-type (length type*))])
+             (and se* (materialize-aggregate src type* se* expr render-inner)))]
+          [else
+           (materialize-scalar src target-type source-type expr render-inner)]))
+
+      ;; expr-expected-type: the destination type a `safe-cast` wrapper
+      ;; records for its inner expression — the typechecker's own judgment of
+      ;; what the wrapped value must become at its use position. A boundary
+      ;; threads this as `current-expr-expected-type` when the destination is
+      ;; not otherwise known at the site (a call argument's formal type, a
+      ;; comparison/equality operand's joined type, a ledger write's field
+      ;; type): the typechecker wraps every such position with
+      ;; `maybe-safecast`, so the wrapper's own target IS the destination.
+      ;; Returns #f for an un-wrapped expression (no coercion was required).
+      (define (expr-expected-type expr)
+        (nanopass-case (Ltypescript Expression) expr
+          [(safe-cast ,src ,type ,type^ ,expr^) type]
+          [else #f]))
 
       ;; -----------------------------------------------------------------
       ;; Stdlib lookup tables.

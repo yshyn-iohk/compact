@@ -129,6 +129,28 @@ const FIXTURES: &[(&str, &str)] = &[
     // overflow, yield a WRONG VALUE in code that still compiles.
     // Executing gate: tests/widening_arith_fixture.rs.
     ("widening_arith_fixture.compact", "widening-arith-fixture"),
+    // Mixed-MINIMAL-width operands at comparison/equality boundaries: the
+    // typer wraps the narrower operand of `q * 4 <= y` (product ranges to
+    // u64, `y` is u32) in a `safe-cast`, which the emitter now materialises
+    // as `((y) as u64)`. `widening_arith_fixture` covers the mbits ladder at
+    // uniform declared widths; this one covers operands of ONE binary
+    // operation whose minimal Rust widths differ, across all six comparison
+    // operators, mixed-width `+ - *`, the guarded-subtraction route, an
+    // impure inline equality, and the constructor. Executing gate:
+    // tests/mixed_width_operand_fixture.rs.
+    (
+        "mixed_width_operand_fixture.compact",
+        "mixed-width-operand-fixture",
+    ),
+    // Type-directed coercion of bare literals and Uint values: Field const
+    // RHS, struct Field member, `some<Field>(0)`, `persistentHash([0])`,
+    // native / pure-call argument, return tail, scalar and wide Uint→Field,
+    // aggregate Field vector, and destination-typed ledger writes. Executing
+    // gate: tests/literal_coercion.rs (state-byte parity + round-trips).
+    (
+        "literal_coercion_fixture.compact",
+        "literal-coercion-fixture",
+    ),
 ];
 
 /// Walks up from `start` looking for the repository root: the nearest

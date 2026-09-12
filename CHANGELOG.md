@@ -5,6 +5,53 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Toolchain 0.31.117, language 0.23.103, runtime 0.16.100]
+
+### Fixed
+
+- **`--target rust` emitted un-typed Rust integers wherever a bare literal (or
+  a `Uint` value) sat in a typed position**, so the generated crate failed
+  `cargo build` while `compactc` exited 0. A `Field` const RHS (`const x: Field
+  = 0;`), a struct `Field` member, `some<Field>(0)`, a `persistentHash([0])`
+  element, a native argument, a return tail, and a destination-typed ledger
+  write each emitted a bare `0`/`1`/ambiguous `AlignedValue::from(0)` instead of
+  the destination type. Every expression is now rendered against the Compact
+  type its use position requires, materialising the typechecker's `safe-cast`
+  wrapper at a single decision point (`materialize-at-type`); a `Uint → Field`
+  coercion zero-extends losslessly (`Fr::from((x) as u64)`, or `as u128` above
+  `u64::MAX`) and refuses above `u128::MAX` rather than truncating.
+
+- **A `Field` literal above `u64::MAX` emitted an out-of-range `u64` literal.**
+  Every literal coerced into a `Field` position was rendered `Fr::from(<n>u64)`,
+  so a legal `Field` literal past `u64::MAX` — a range that runs up to
+  `max-field` (~2^255) — produced a `u64` literal that overflowed and failed
+  `cargo build` while `compactc` exited 0. Literals now pick their width from
+  the `Field` domain at one point (`field-literal-rust`): `u64`, then `u128`,
+  then the little-endian `Fr::from_le_bytes` constructor for the range above
+  `u128::MAX`. The `u64` rung keeps previously-correct output byte-identical.
+
+- **Mixed minimal-width comparison operands were peeled instead of widened.**
+  `q * 4` on `q: Uint<32>` range-types to `u64`; compared against a `Uint<32>`
+  value, the typechecker wraps the narrower operand and the emitter peeled the
+  wrapper, so the two sides met at different Rust widths (E0308 at `cargo
+  build`, `compactc` exit 0). The narrower operand is now widened losslessly
+  (`((x) as u64)`), on both the pure and constructor/impure routes; ranges that
+  already share a Rust width gain no cast, and `+ - *` keep their existing
+  same-width normalisation.
+
+- **A constructor whose `const` RHS lifted a temp was unwalkable.** The
+  declaration-only `const` the typer emits for a `maybe-bind`-lifted temp (e.g.
+  `const diff = base - q * 4;`) was not skipped by the constructor walker, so a
+  body like `constructor(q, y) { assert(q * 4 <= y, …); … }` fell outside every
+  shape. The constructor walker now skips the declaration and renders the
+  matching lifted assignment, mirroring the streaming walker.
+
+- **A renderer that could not lower an expression could splice a `#f`
+  sentinel into `lib.rs`.** The emitted text is now buffered and scanned before
+  it is written; a `#f` outside a string/comment/raw-identifier aborts with a
+  located `sentinel-splice` error and writes no `lib.rs`, replacing the weak
+  `/* TODO` scan as the correctness guarantee.
+
 ## [Toolchain 0.31.116, language 0.23.103, runtime 0.16.100]
 
 ### Fixed

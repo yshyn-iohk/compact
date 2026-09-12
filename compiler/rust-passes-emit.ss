@@ -281,7 +281,8 @@
                                      native-id-ht witness-id-ht circuit-id-ht)
         (let* ([st (struct-of-type type)]
                [struct-name (and st (car st))]
-               [elt-name* (and st (cadr st))])
+               [elt-name* (and st (cadr st))]
+               [elt-type* (and st (caddr st))])
           (cond
             [(not st)
              (rust-feature-error src 'struct-literal-non-tstruct
@@ -293,12 +294,16 @@
             [else
              (let* ([rust-struct-name (struct-rust-name-of type struct-name)]
                     [field-strs
-                     (map (lambda (name e)
+                     ;; Each initialiser renders at the member's declared
+                     ;; type so a bare literal member (task 2.6) is coerced
+                     ;; to it.
+                     (map (lambda (name e mtype)
                             (format "~a: ~a"
                                     (symbol->string name)
-                                    (ctor-expr-rust e local-binds
-                                                    native-id-ht witness-id-ht circuit-id-ht)))
-                          elt-name* expr*)])
+                                    (parameterize ([current-expr-expected-type mtype])
+                                      (ctor-expr-rust e local-binds
+                                                      native-id-ht witness-id-ht circuit-id-ht))))
+                          elt-name* expr* elt-type*)])
                (string-append
                  rust-struct-name
                  " { "
@@ -617,7 +622,7 @@
       ;; coerce-literal-rhs-rendered: Prod-9/Prod-13 — typed integer literals
       ;; need to be rendered with the correct Rust type so the ledger-write
       ;; builder's `Into<AlignedValue>` bound is satisfied.
-      ;;   - `tfield`: wrap as `Fr::from(<n>u64)`.
+      ;;   - `tfield`: materialise as an `Fr` (`field-literal-rust`).
       ;;   - `tunsigned`: append the width suffix (`<n>u8` .. `<n>u128`) so
       ;;     the literal types as the same Rust primitive the ledger field
       ;;     uses. Without this, `ledger v: Uint<64>; v = 42;` lowered into
@@ -629,7 +634,7 @@
         (cond
           [(type-is-tfield? decl-type)
            (let ([n (literal-int-expr? rhs)])
-             (and n (format "Fr::from(~au64)" n)))]
+             (and n (field-literal-rust n)))]
           [(type-peel-tunsigned decl-type) =>
            (lambda (nat)
              (let ([n (literal-int-expr? rhs)])
@@ -1314,10 +1319,19 @@
                                        native-id-ht witness-id-ht circuit-id-ht)
         (let* ([cond-str (cond-rust cond-expr '()
                                     native-id-ht witness-id-ht circuit-id-ht)]
-               [then-str (ctor-expr-rust then-expr '()
-                                         native-id-ht witness-id-ht circuit-id-ht)]
-               [else-str (ctor-expr-rust else-expr '()
-                                         native-id-ht witness-id-ht circuit-id-ht)])
+               ;; Task 2.2: each return arm renders at the declared return
+               ;; type so a widening arm coerces; a primitive literal is
+               ;; peeled (see render-tail-at).
+               [then-str (render-tail-at then-expr return-type
+                           (lambda (exp)
+                             (parameterize ([current-expr-expected-type exp])
+                               (ctor-expr-rust then-expr '()
+                                               native-id-ht witness-id-ht circuit-id-ht))))]
+               [else-str (render-tail-at else-expr return-type
+                           (lambda (exp)
+                             (parameterize ([current-expr-expected-type exp])
+                               (ctor-expr-rust else-expr '()
+                                               native-id-ht witness-id-ht circuit-id-ht))))])
           (cond
             [(or (rendered-has-todo? cond-str)
                  (rendered-has-todo? then-str)
@@ -1349,14 +1363,22 @@
                        (let ([c-str (cond-rust (car a) '()
                                                native-id-ht witness-id-ht
                                                circuit-id-ht)]
-                             [t-str (ctor-expr-rust (cadr a) '()
-                                                    native-id-ht witness-id-ht
-                                                    circuit-id-ht)])
+                             ;; Task 2.2: return arms render at the declared
+                             ;; return type (literal peel via render-tail-at).
+                             [t-str (render-tail-at (cadr a) return-type
+                                      (lambda (exp)
+                                        (parameterize ([current-expr-expected-type exp])
+                                          (ctor-expr-rust (cadr a) '()
+                                                          native-id-ht witness-id-ht
+                                                          circuit-id-ht))))])
                          (list c-str t-str)))
                      arms)]
-               [else-str (ctor-expr-rust else-expr '()
-                                         native-id-ht witness-id-ht
-                                         circuit-id-ht)]
+               [else-str (render-tail-at else-expr return-type
+                           (lambda (exp)
+                             (parameterize ([current-expr-expected-type exp])
+                               (ctor-expr-rust else-expr '()
+                                               native-id-ht witness-id-ht
+                                               circuit-id-ht))))]
                [any-todo?
                 (or (rendered-has-todo? else-str)
                     (let loop ([xs arm-strs])
@@ -1531,6 +1553,10 @@
       ;; first, since impure circuits can't be a direct Rust call target.
       (define (cond-rust expr local-binds
                          native-id-ht witness-id-ht circuit-id-ht)
+        ;; Task 2.4: an `if`/`assert` condition is Boolean. Clear any
+        ;; inherited expression expectation so a destination type from the
+        ;; enclosing position cannot leak into the condition's sub-renders.
+        (parameterize ([current-expr-expected-type #f])
         (let ([e (expr-strip-cast expr)])
           (nanopass-case (Ltypescript Expression) e
             [(call ,src ,function-name ,expr* ...)
@@ -1561,7 +1587,7 @@
                     (id-sym function-name))]))]
             [else
              (ctor-expr-rust e local-binds
-                             native-id-ht witness-id-ht circuit-id-ht)])))
+                             native-id-ht witness-id-ht circuit-id-ht)]))))
 
       ;; emit-impure-circuit: emit an impure circuit as a method on
       ;; `impl<PS, W> Contract<PS, W>`. Takes `&self, ctx: CircuitContext<PS>`
@@ -1748,6 +1774,12 @@
           [else #f]))
 
       (define (arith-binop-rust src op mbits expr1 expr2 native-id-ht)
+        ;; Operands are NOT type-directed: the typer wraps both in
+        ;; safe-casts to the result width, but `arith-binop-rust` already
+        ;; casts each operand to the `mbits`-derived width. Materialising the
+        ;; operand wrappers too would double-cast (`((x) as u64) as u64`),
+        ;; so the expected type is cleared for the operand renders.
+        (parameterize ([current-expr-expected-type #f])
         (let ([e1 (arith-operand-rust expr1 native-id-ht)]
               [e2 (arith-operand-rust expr2 native-id-ht)]
               [w (mbits->rust-width mbits)])
@@ -1781,7 +1813,7 @@
             ;; a release demonstrating.
             [else
              (rust-feature-error src 'arith-result-width
-               "unsigned arithmetic with a ~a-bit result has no Rust lowering" mbits)])))
+               "unsigned arithmetic with a ~a-bit result has no Rust lowering" mbits)]))))
 
       ;; expr-rust: emit a Rust expression string for an Ltypescript
       ;; Expression. I3b/1 covers the variants needed by tiny.compact's
@@ -1846,29 +1878,109 @@
            (let* ([binds (current-var-substitution)]
                   [proposed (symbol->string (camel->snake (id-sym var-name)))]
                   [rust-name (uniquify-rust-name proposed binds)]
-                  [rhs (expr-rust expr^ native-id-ht)])
+                  ;; Render at the RHS wrapper's own target — the lifted
+                  ;; temp's declared type — so a bare literal / widening
+                  ;; materialises (task 2.1, assignment route).
+                  [rhs (expr-rust-typed expr^ (expr-expected-type expr^) native-id-ht)])
              (values (format "let ~a = ~a;" rust-name rhs)
                      (cons var-name rust-name)))]
           [else
            (values (string-append (expr-rust e native-id-ht) ";") #f)]))
 
+      ;; expr-rust-typed: render `expr` against the Compact type expected by
+      ;; its use position. Binds `current-expr-expected-type` for the dynamic
+      ;; extent of the render so the safe-cast / literal clauses below can
+      ;; materialise the typechecker's coercion. Every boundary that knows its
+      ;; destination type calls this instead of `expr-rust`; with the default
+      ;; #f (any un-wired caller) rendering is byte-identical to before.
+      (define (expr-rust-typed expr expected native-id-ht)
+        ;; Always bind, even to #f: a boundary that renders a sub-expression
+        ;; at a DIFFERENT destination than its enclosing one (a call argument
+        ;; under a const RHS, an arithmetic operand) must be able to clear an
+        ;; inherited expectation as well as set one. Binding #f where the
+        ;; enclosing extent already has #f is byte-identical to not binding.
+        (parameterize ([current-expr-expected-type expected])
+          (expr-rust expr native-id-ht)))
+
+      ;; cmp-operand-rust: render one ordering/equality comparison operand at
+      ;; the joined operand type `joined-type`. The typechecker wraps a
+      ;; narrower operand in `(safe-cast <joined> <own> ...)`
+      ;; (analysis-passes.ss relational-/equality-operator), so rendering at
+      ;; `joined-type` materialises exactly the lossless zero-extension a
+      ;; mixed-width site needs and leaves the wider side (un-wrapped) at its
+      ;; own minimal Rust width. A bare integer literal is peeled (rendered
+      ;; un-suffixed) so it unifies with the other operand through Rust
+      ;; inference — EXCEPT when the join is Field, where an integer literal
+      ;; can never unify with the `Fr` struct and must be materialised as an
+      ;; `Fr` (`field-literal-rust`, which picks the lossless width).
+      ;; `joined-type` is the comparison node's own type
+      ;; for `==`/`!=`; for ordering nodes (which carry only `bits`) it is
+      ;; recovered from whichever operand the typer wrapped.
+      (define (cmp-operand-rust expr joined-type native-id-ht)
+        (cond
+          [(literal-int-expr? expr)
+           (if (type-is-tfield? joined-type)
+               (field-literal-rust (literal-int-expr? expr))
+               (expr-rust-typed expr #f native-id-ht))]
+          [else (expr-rust-typed expr joined-type native-id-ht)]))
+
+      ;; cmp-join-type: the joined operand type of an ordering (`< <= > >=`)
+      ;; node, which carries only `bits`. Both operands were `maybe-safecast`ed
+      ;; to the same join by the typer, so the first operand that carries a
+      ;; `safe-cast` wrapper names it; when neither does, the operands already
+      ;; share a type and no coercion is needed (#f).
+      (define (cmp-join-type expr1 expr2)
+        (or (expr-expected-type expr1) (expr-expected-type expr2)))
+
+      ;; render-tail-at: render a return-value expression at the declared
+      ;; return type, preserving the bare-literal peel for primitive (Uint)
+      ;; returns — Rust infers the literal from the function's return type,
+      ;; so suffixing would churn a both-literal ternary's arms — while a
+      ;; Field return materialises the literal as an `Fr` (`field-literal-rust`;
+      ;; an integer can never unify with the `Fr` struct). `render-at` is a one-argument
+      ;; thunk taking the expected type so this composes over either the
+      ;; expression (`expr-rust`) or constructor (`ctor-expr-rust`) renderer.
+      (define (render-tail-at expr return-type render-at)
+        (cond
+          [(literal-int-expr? expr)
+           (if (type-is-tfield? return-type)
+               (field-literal-rust (literal-int-expr? expr))
+               (render-at #f))]
+          [else (render-at return-type)]))
+
       (define (expr-rust expr native-id-ht)
         (nanopass-case (Ltypescript Expression) expr
           [(safe-cast ,src ,type ,type^ ,expr^)
-           ;; Iter 7: peel safe-cast layers transparently. The IR uses
-           ;; safe-cast to widen literals (e.g. `1: Uint<1>` → `Uint<64>`)
-           ;; inside tuple/vector arguments and map iterables. For our
-           ;; rendering purposes the cast is value-preserving — the
-           ;; underlying integer literal carries the right Rust integer
-           ;; type once we ascribe it at the surrounding context (or
-           ;; rely on Rust's inference from the array element type).
-           ;; Mirrors `expr-strip-cast` but for the rendering path.
-           (expr-rust expr^ native-id-ht)]
+           ;; Materialise the typer's coercion when a use position has
+           ;; declared an expected type; otherwise peel, byte-identical to the
+           ;; pre-change behaviour. `materialize-at-type` returns #f when the
+           ;; wrapper is one the inner rendering already satisfies (same type
+           ;; / same Rust width / a literal Rust can infer), so the peel path
+           ;; still runs. `materialize-at-type` binds the inner render's
+           ;; expected type itself, so a nested value is never coerced twice.
+           (let ([expected (current-expr-expected-type)])
+             (if expected
+                 (or (materialize-at-type src expected type^ expr^
+                       (lambda (e) (expr-rust e native-id-ht)))
+                     (expr-rust expr^ native-id-ht))
+                 (expr-rust expr^ native-id-ht)))]
           [(quote ,src ,datum)
            (cond
              [(bytevector? datum) (bytevector->rust-array-literal datum)]
              [(boolean? datum) (if datum "true" "false")]
-             [(and (integer? datum) (exact? datum)) (format "~a" datum)]
+             [(and (integer? datum) (exact? datum))
+              ;; A bare literal in a typed position (e.g. the RHS of
+              ;; `const x: Field = 0;` or a Field struct-member initialiser)
+              ;; must carry the destination's Rust type: `Fr::from(0u64)` for
+              ;; Field, the width suffix for a `Uint<N>`. With no expectation
+              ;; the literal stays bare (byte-identical).
+              (let ([expected (current-expr-expected-type)])
+                (cond
+                  [(and expected (type-is-tfield? expected))
+                   (field-literal-rust datum)]
+                  [(and expected (type-peel-tunsigned expected)) =>
+                   (lambda (nat) (format "~a~a" datum (uint-rust-width nat)))]
+                  [else (format "~a" datum)]))]
              [else (rust-feature-error src 'quote-variant
                      "unsupported quote datum: ~s" datum)])]
           [(var-ref ,src ,var-name)
@@ -1888,9 +2000,17 @@
            ;; which form is wanted. For I3b/1 we render every `tuple` as a
            ;; Rust array literal — the only consumer is persistent_hash,
            ;; where the elements have identical type ([u8; 32]).
-           (let ([parts
-                  (map (lambda (ta) (tuple-arg-rust ta native-id-ht))
-                       tuple-arg*)])
+           ;;
+           ;; When the enclosing position declared an aggregate expected
+           ;; type (a `safe-cast` to `Vector<N, T>` recovered by the
+           ;; caller), each element renders at the element type so a bare
+           ;; literal element is coerced (`[0]` -> `[Fr::from(0u64)]`).
+           (let* ([n (length tuple-arg*)]
+                  [elt-types (expected-elt-types n)]
+                  [parts
+                   (map (lambda (ta et) (tuple-arg-rust ta native-id-ht et))
+                        tuple-arg*
+                        (or elt-types (make-list n #f)))])
              (string-append
                "["
                (let join ([xs parts] [acc ""])
@@ -1910,9 +2030,12 @@
            ;; I3b/3: equality comparison. Parenthesised so it composes
            ;; safely inside larger expressions (e.g. inside a Rust assert
            ;; macro call without surrounding parens being implicit).
+           ;; Operands render at the comparison's own (joined) type so a
+           ;; mixed-width operand widens losslessly and a Field literal
+           ;; becomes `Fr::from(<n>u64)`.
            (format "(~a == ~a)"
-                   (expr-rust expr1 native-id-ht)
-                   (expr-rust expr2 native-id-ht))]
+                   (cmp-operand-rust expr1 type native-id-ht)
+                   (cmp-operand-rust expr2 type native-id-ht))]
           [(not ,src ,expr)
            ;; F1.2: Boolean negation.
            (format "(!(~a))" (expr-rust expr native-id-ht))]
@@ -2025,7 +2148,8 @@
                   "downcast-unsigned: unsupported target width ~s" nat)]
                [else
                 (format "(~a) as ~a"
-                        (parameterize ([current-arith-suffix w])
+                        (parameterize ([current-arith-suffix w]
+                                       [current-expr-expected-type #f])
                           (expr-rust expr native-id-ht))
                         w)]))]
           [(new ,src ,type ,expr* ...)
@@ -2035,7 +2159,8 @@
            ;; corresponding case in ctor-expr-rust is used instead.
            (let* ([st (struct-of-type type)]
                   [struct-name (and st (car st))]
-                  [elt-name* (and st (cadr st))])
+                  [elt-name* (and st (cadr st))]
+                  [elt-type* (and st (caddr st))])
              (cond
                [(or (not st)
                     (not (fx= (length expr*) (length elt-name*))))
@@ -2046,11 +2171,11 @@
                   (length expr*))]
                [else
                 (let* ([field-strs
-                        (map (lambda (name e)
+                        (map (lambda (name e mtype)
                                (format "~a: ~a"
                                        (symbol->string name)
-                                       (expr-rust e native-id-ht)))
-                             elt-name* expr*)])
+                                       (expr-rust-typed e mtype native-id-ht)))
+                             elt-name* expr* elt-type*)])
                   (string-append
                     (struct-rust-name-of type struct-name)
                     " { "
@@ -2067,29 +2192,33 @@
            ;; the `==` rendering; structs derive PartialEq/Eq so `!=` is
            ;; structural for user types just as `==` is.
            (format "(~a != ~a)"
-                   (expr-rust expr1 native-id-ht)
-                   (expr-rust expr2 native-id-ht))]
+                   (cmp-operand-rust expr1 type native-id-ht)
+                   (cmp-operand-rust expr2 type native-id-ht))]
           [(< ,src ,bits ,expr1 ,expr2)
            ;; F1.3: ordering comparisons on Uint<N> (Rust unsigned ints).
-           ;; Operands render through expr-rust so downcast-unsigned /
-           ;; arithmetic / field-access lower correctly; the typer inserts
-           ;; downcast-unsigned around literals so both sides share the
-           ;; same Rust unsigned width (no i32/u32 mismatch).
-           (format "(~a < ~a)"
-                   (expr-rust expr1 native-id-ht)
-                   (expr-rust expr2 native-id-ht))]
+           ;; Operands render at the typer's joined operand type (recovered
+           ;; from whichever side it wrapped) so a mixed-width comparison
+           ;; widens the narrower side; bare literals are peeled. The `bits`
+           ;; field records only the width, so it cannot name the join.
+           (let ([jt (cmp-join-type expr1 expr2)])
+             (format "(~a < ~a)"
+                     (cmp-operand-rust expr1 jt native-id-ht)
+                     (cmp-operand-rust expr2 jt native-id-ht)))]
           [(<= ,src ,bits ,expr1 ,expr2)
-           (format "(~a <= ~a)"
-                   (expr-rust expr1 native-id-ht)
-                   (expr-rust expr2 native-id-ht))]
+           (let ([jt (cmp-join-type expr1 expr2)])
+             (format "(~a <= ~a)"
+                     (cmp-operand-rust expr1 jt native-id-ht)
+                     (cmp-operand-rust expr2 jt native-id-ht)))]
           [(> ,src ,bits ,expr1 ,expr2)
-           (format "(~a > ~a)"
-                   (expr-rust expr1 native-id-ht)
-                   (expr-rust expr2 native-id-ht))]
+           (let ([jt (cmp-join-type expr1 expr2)])
+             (format "(~a > ~a)"
+                     (cmp-operand-rust expr1 jt native-id-ht)
+                     (cmp-operand-rust expr2 jt native-id-ht)))]
           [(>= ,src ,bits ,expr1 ,expr2)
-           (format "(~a >= ~a)"
-                   (expr-rust expr1 native-id-ht)
-                   (expr-rust expr2 native-id-ht))]
+           (let ([jt (cmp-join-type expr1 expr2)])
+             (format "(~a >= ~a)"
+                     (cmp-operand-rust expr1 jt native-id-ht)
+                     (cmp-operand-rust expr2 jt native-id-ht)))]
           [(seq ,src ,expr* ... ,expr)
            ;; F1.4: a guarded expression block. The Compact typer wraps
            ;; trapping unsigned arithmetic (e.g. `currentDay - dateOfBirthDays`
@@ -2362,12 +2491,26 @@
       ;; tuple-arg-rust: emit a Rust expression for a Tuple-Argument
       ;; (`single` or `spread`). I3b/1 only needs `single`; `spread` emits a
       ;; TODO placeholder.
-      (define (tuple-arg-rust ta native-id-ht)
+      (define (tuple-arg-rust ta native-id-ht . maybe-expected)
+        (let ([expected (and (pair? maybe-expected) (car maybe-expected))])
         (nanopass-case (Ltypescript Tuple-Argument) ta
-          [(single ,src ,expr) (expr-rust expr native-id-ht)]
+          [(single ,src ,expr)
+           ;; `expected` (when supplied) is the element type the enclosing
+           ;; aggregate/vector declares, so a bare literal element is
+           ;; coerced (`[0]` feeding `Vector<1, Field>` -> `Fr::from(0u64)`).
+           ;; Unsullied callers pass #f and keep the bare rendering.
+           (expr-rust-typed expr expected native-id-ht)]
           [(spread ,src ,nat ,expr)
            (rust-feature-error src 'tuple-spread
-             "tuple spread (`...expr`) not supported")]))
+             "tuple spread (`...expr`) not supported")])))
+
+      ;; expected-elt-types: element types of the current expected type when
+      ;; it is an aggregate of arity `n` (a `Vector<n, T>` or `Tuple<...>`),
+      ;; else #f. Lets the `tuple`/aggregate clauses render every element at
+      ;; the element type the enclosing wrapper declares (task 2.7).
+      (define (expected-elt-types n)
+        (let ([t (current-expr-expected-type)])
+          (and t (type-elt-types t n))))
 
       ;; call-rust: emit a Rust call expression for `(call src function-name
       ;; expr* ...)`. Resolves the function-name id to a native binding via
@@ -2393,7 +2536,10 @@
       ;; takes `JubjubPoint` by value and is invoked twice on the same
       ;; field in a && expression).
       (define (pure-call-arg-rust e native-id-ht)
-        (let ([rendered (expr-rust e native-id-ht)]
+        ;; Render at the argument's own `safe-cast` target (the callee's
+        ;; declared formal type) so a bare literal / mixed-width / aggregate
+        ;; argument is materialised; see task 2.5.
+        (let ([rendered (expr-rust-typed e (expr-expected-type e) native-id-ht)]
               [stripped (expr-strip-cast e)])
           (nanopass-case (Ltypescript Expression) stripped
             [(var-ref ,src ,var-name)
@@ -2407,6 +2553,29 @@
                [else (string-append rendered ".clone()")])]
             [else rendered])))
 
+      ;; native-vector-elem-strs: render a vector-typed native argument
+      ;; (persistentHash / transientHash) as a list of
+      ;; `AlignedValue::from(<elem>)` atoms. The argument is a `(tuple ...)`
+      ;; typically wrapped in `(safe-cast <Vector<N,T>> ...)`; peeling the
+      ;; cast exposes the tuple and the wrapper's target supplies the
+      ;; element type, so a bare literal element is coerced
+      ;; (`[0]` -> `AlignedValue::from(Fr::from(0u64))`). A non-tuple
+      ;; argument renders whole at its own expected type.
+      (define (native-vector-elem-strs arg native-id-ht)
+        (let ([t (expr-expected-type arg)])
+          (nanopass-case (Ltypescript Expression) (expr-strip-cast arg)
+            [(tuple ,src ,tuple-arg* ...)
+             (let* ([n (length tuple-arg*)]
+                    [elt-types (and t (type-elt-types t n))])
+               (map (lambda (ta et)
+                      (format "midnight_compact_runtime::AlignedValue::from(~a)"
+                              (tuple-arg-rust ta native-id-ht et)))
+                    tuple-arg*
+                    (or elt-types (make-list n #f))))]
+            [else
+             (list (format "midnight_compact_runtime::AlignedValue::from(~a)"
+                           (expr-rust-typed arg t native-id-ht)))])))
+
       (define (call-rust src function-name expr* native-id-ht)
         (let ([ne (eq-hashtable-ref native-id-ht function-name #f)]
               [sym (id-sym function-name)])
@@ -2419,7 +2588,9 @@
              ;; pelt and ascribes the generic — this branch is a safety
              ;; net for any future ascription-free use site.
              (let ([args
-                    (map (lambda (e) (expr-rust e native-id-ht)) expr*)])
+                    (map (lambda (e)
+                           (expr-rust-typed e (expr-expected-type e) native-id-ht))
+                         expr*)])
                (format "midnight_compact_runtime::std_lib::~a(~a)"
                        sym
                        (let join ([xs args] [acc ""])
@@ -2463,15 +2634,7 @@
                          ;; (Compact-level Vector), break it apart so each
                          ;; element becomes its own AlignedValue. Otherwise,
                          ;; emit a one-element slice.
-                         (nanopass-case (Ltypescript Expression) arg
-                           [(tuple ,src ,tuple-arg* ...)
-                            (map (lambda (ta)
-                                   (format "midnight_compact_runtime::AlignedValue::from(~a)"
-                                           (tuple-arg-rust ta native-id-ht)))
-                                 tuple-arg*)]
-                           [else
-                            (list (format "midnight_compact_runtime::AlignedValue::from(~a)"
-                                          (expr-rust arg native-id-ht)))])])
+                         (native-vector-elem-strs arg native-id-ht)])
                     (string-append
                       "midnight_compact_runtime::std_lib::persistent_hash_aligned(&["
                       (let join ([xs elt-strs] [acc ""])
@@ -2504,15 +2667,7 @@
                [(fx= (length expr*) 1)
                 (let ([arg (car expr*)])
                   (let ([elt-strs
-                         (nanopass-case (Ltypescript Expression) arg
-                           [(tuple ,src ,tuple-arg* ...)
-                            (map (lambda (ta)
-                                   (format "midnight_compact_runtime::AlignedValue::from(~a)"
-                                           (tuple-arg-rust ta native-id-ht)))
-                                 tuple-arg*)]
-                           [else
-                            (list (format "midnight_compact_runtime::AlignedValue::from(~a)"
-                                          (expr-rust arg native-id-ht)))])])
+                         (native-vector-elem-strs arg native-id-ht)])
                     (string-append
                       "midnight_compact_runtime::std_lib::transient_hash_aligned(&["
                       (let join ([xs elt-strs] [acc ""])
@@ -2706,7 +2861,18 @@
                    (format "compact_assert!(~a, ~s);" cond-str
                            (if (string? mesg) mesg ""))]))]
              [else
-              (let ([s (guard (c [#t #f]) (expr-rust expr native-id-ht))])
+              ;; In tail position render at the declared return type so a
+              ;; statement-lifted `return <literal>` coerces (task 2.2);
+              ;; non-tail statements keep the un-ascribed rendering. A
+              ;; primitive literal is peeled so a both-literal ternary's
+              ;; arms stay byte-identical.
+              (let ([s (guard (c [#t #f])
+                         (if last?
+                             (render-tail-at expr (current-pure-return-type)
+                                             (lambda (exp)
+                                               (expr-rust-typed expr exp native-id-ht)))
+                             (expr-rust-typed expr #f native-id-ht)))])
+
                 (cond
                   [(or (not s) (rendered-has-todo? s)) #f]
                   [last? s]
@@ -2756,8 +2922,16 @@
                         ;; binder. The RHS can't reference var-name itself, so
                         ;; adding the entry early only affects name selection.
                         [rhs-binds (cons (cons var-name rust-name) binds)])
+                   ;; Render the RHS at the binding's declared type (task
+                   ;; 2.1, pure route). The typer wraps a consequential RHS
+                   ;; in `safe-cast` to the declared type; a bare literal
+                   ;; therefore becomes `Fr::from(<n>u64)` / `<n>u64` and a
+                   ;; widening materialises.
                    (let ([s (guard (c [#t #f])
-                              (parameterize ([current-var-substitution rhs-binds])
+                              (parameterize ([current-var-substitution rhs-binds]
+                                             [current-expr-expected-type
+                                              (or (const-binding-decl-type (car xs))
+                                                  (expr-expected-type rhs))])
                                 (expr-rust rhs native-id-ht)))])
                      (cond
                        [(or (not s) (rendered-has-todo? s)) #f]
@@ -2781,7 +2955,8 @@
                         ;; rust-name for the duration of the RHS render.
                         [rhs-binds (cons (cons var-name rust-name) binds)])
                    (let ([s (guard (c [#t #f])
-                              (parameterize ([current-var-substitution rhs-binds])
+                              (parameterize ([current-var-substitution rhs-binds]
+                                             [current-expr-expected-type (expr-expected-type rhs)])
                                 (expr-rust rhs native-id-ht)))])
                      (cond
                        [(or (not s) (rendered-has-todo? s)) #f]
@@ -2864,7 +3039,11 @@
            (out (format ") -> Result<~a, CompactError> {\n" (type-rust type)))
            (parameterize ([current-formal-arg-types (build-formal-arg-type-ht arg*)]
                           [current-circuit-id-ht circuit-id-ht]
-                          [current-witness-id-ht witness-id-ht])
+                          [current-witness-id-ht witness-id-ht]
+                          ;; Task 2.2: the pure walker threads the declared
+                          ;; return type into tail position so a
+                          ;; statement-lifted return tail coerces.
+                          [current-pure-return-type type])
              (let ([body (stmt-pure-body-rust stmt native-id-ht
                                               witness-id-ht circuit-id-ht '()
                                               #t)])

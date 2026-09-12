@@ -817,6 +817,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "compact-contract-literal-coercion-fixture"
+version = "0.1.0"
+dependencies = [
+ "midnight-compact-runtime",
+]
+
+[[package]]
 name = "compact-contract-map-fixture"
 version = "0.1.0"
 dependencies = [
@@ -832,6 +839,13 @@ dependencies = [
 
 [[package]]
 name = "compact-contract-map-lambda-fixture"
+version = "0.1.0"
+dependencies = [
+ "midnight-compact-runtime",
+]
+
+[[package]]
+name = "compact-contract-mixed-width-operand-fixture"
 version = "0.1.0"
 dependencies = [
  "midnight-compact-runtime",
@@ -4807,9 +4821,11 @@ dependencies = [
  "compact-contract-hmt-default-fixture",
  "compact-contract-if-stmt-fixture",
  "compact-contract-list-fixture",
+ "compact-contract-literal-coercion-fixture",
  "compact-contract-map-fixture",
  "compact-contract-map-fn-fixture",
  "compact-contract-map-lambda-fixture",
+ "compact-contract-mixed-width-operand-fixture",
  "compact-contract-module-fixture",
  "compact-contract-multi-pl-call-fixture",
  "compact-contract-nested-map-fixture",

@@ -181,6 +181,11 @@
              (emit-ledger-view (program-ledger-fields pelt*))
              (emit-pure-circuits pure-circuit* native-id-ht
                                   witness-id-ht circuit-id-ht))))
+         ;; Task 4.1: everything has been buffered through `out`; refuse if a
+         ;; spliced sentinel reached the text, else write lib.rs. A refusal
+         ;; here leaves no lib.rs (the target-port exception handler deletes
+         ;; the still-empty file).
+         (flush-rust-output! src)
          (emit-cargo-toml))
        ir]))
 

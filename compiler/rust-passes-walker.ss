@@ -198,8 +198,8 @@
       ;; native-id-ht / witness-id-ht / circuit-id-ht let call-site
       ;; classification distinguish pure-circuit / witness / native calls.
       ;; coerce-cmp-operand-rust: render a comparison (`==`/`!=`) operand,
-      ;; coercing a bare integer literal to `Fr::from(<n>u64)` when the
-      ;; comparison `type` is `Field` (tfield). The typer types integer
+      ;; coercing a bare integer literal to an `Fr` (`field-literal-rust`)
+      ;; when the comparison `type` is `Field` (tfield). The typer types integer
       ;; literals in a Field-typed comparison as `Field`, but expr-rust
       ;; renders `(quote 0)` as the bare Rust integer `0` — which then
       ;; fails to type-check against the `Fr` produced by the other
@@ -209,11 +209,25 @@
       (define (coerce-cmp-operand-rust expr type local-binds
                                         native-id-ht witness-id-ht circuit-id-ht)
         (cond
-          [(and (type-is-tfield? type) (literal-int-expr? expr))
-           (format "Fr::from(~au64)" (literal-int-expr? expr))]
+          ;; Bare-literal peel preserved for byte-stability (Rust unifies a
+          ;; bare integer literal with the other operand's primitive width)
+          ;; EXCEPT when the joined type is Field, where an integer literal
+          ;; can never unify with the `Fr` struct and must be materialised as
+          ;; an `Fr` (`field-literal-rust`).
+          [(literal-int-expr? expr)
+           (if (type-is-tfield? type)
+               (field-literal-rust (literal-int-expr? expr))
+               (parameterize ([current-expr-expected-type #f])
+                 (ctor-expr-rust expr local-binds
+                                 native-id-ht witness-id-ht circuit-id-ht)))]
           [else
-           (ctor-expr-rust expr local-binds
-                           native-id-ht witness-id-ht circuit-id-ht)]))
+           ;; Materialise the operand's `safe-cast` widening (mixed-width
+           ;; equality) or Uint->Field coercion through the central typed
+           ;; entry (task 2.9). `type` is the comparison's joined type;
+           ;; when #f no coercion is needed.
+           (parameterize ([current-expr-expected-type type])
+             (ctor-expr-rust expr local-binds
+                             native-id-ht witness-id-ht circuit-id-ht))]))
 
       (define (ctor-expr-rust expr local-binds
                               native-id-ht witness-id-ht circuit-id-ht)
@@ -223,6 +237,14 @@
         ;; introduced by inline-circuit-call. The dynamic binding mirrors
         ;; the explicit local-binds parameter — both must stay in sync.
         (parameterize ([current-var-substitution local-binds])
+        (or (and (current-expr-expected-type)
+                 (nanopass-case (Ltypescript Expression) expr
+                   [(safe-cast ,src ,type ,type^ ,expr^)
+                    (materialize-at-type src (current-expr-expected-type) type^ expr^
+                      (lambda (e)
+                        (ctor-expr-rust e local-binds
+                                        native-id-ht witness-id-ht circuit-id-ht)))]
+                   [else #f]))
         (let ([e (expr-strip-cast expr)])
           (nanopass-case (Ltypescript Expression) e
             [(var-ref ,src ,var-name)
@@ -395,8 +417,9 @@
              ;; through `new_cell_array` via `current-ledger-field-types`).
              (render-map-mvp src fun map-arg native-id-ht)]
             [else
-             ;; quote/tuple/etc. fall through to the existing expr-rust.
-             (expr-rust e native-id-ht)]))))
+             ;; quote/tuple/etc. fall through to the existing expr-rust,
+             ;; which consults current-expr-expected-type for a bare literal.
+             (expr-rust e native-id-ht)])))))
 
       ;; render-map-mvp: render a `(map src len fun map-arg)` IR node
       ;; as a Rust array literal `[v0, v1, ..., vN-1]`. Assumes
@@ -537,8 +560,13 @@
       ;; the small struct shapes Compact emits.
       (define (arg-rust-clone-if-var e local-binds
                                      native-id-ht witness-id-ht circuit-id-ht)
-        (let ([rendered (ctor-expr-rust e local-binds
-                                        native-id-ht witness-id-ht circuit-id-ht)])
+        ;; Render at the argument's own `safe-cast` target — its declared
+        ;; formal / destination type — so a bare literal, mixed-width, or
+        ;; aggregate argument is materialised (tasks 2.5/2.8). An argument
+        ;; with no wrapper leaves the parameter at #f (no coercion needed).
+        (let ([rendered (parameterize ([current-expr-expected-type (expr-expected-type e)])
+                          (ctor-expr-rust e local-binds
+                                          native-id-ht witness-id-ht circuit-id-ht))])
           (let ([stripped (expr-strip-cast e)])
             (nanopass-case (Ltypescript Expression) stripped
               [(var-ref ,src ,var-name)
@@ -1511,6 +1539,24 @@
           (let loop ([stmts stmts])
             (cond
               [(null? stmts) #t]
+              ;; Task 3.1: a declaration-only `const` is the forward
+              ;; declaration the typer emits whenever a `const` RHS lifts
+              ;; temps via `maybe-bind` (analysis-passes.ss). The eventual
+              ;; `(= ...)` assignment is the real work; the decl itself is a
+              ;; no-op, so skip it (the streaming walker already does —
+              ;; rust-passes-streaming.ss). Without this a constructor whose
+              ;; const RHS lifts a temp (e.g. `const diff = base - q * 4;`)
+              ;; is wholly unwalkable.
+              ;;
+              ;; NOTE: this predicate is deliberately NOT relaxed here. It
+              ;; gates the **impure-circuit** route (emit-impure-circuit tries
+              ;; body-walkable? + emit-body-or-fallback BEFORE the streaming
+              ;; walker); accepting lifted-temp bodies here would divert
+              ;; rich impure bodies off the streaming walker and change their
+              ;; output. The constructor route has no such gate —
+              ;; emit-ctor-body-or-fallback calls emit-body-or-fallback
+              ;; directly — so the skip/assignment handling lives only in the
+              ;; emitter's loop below, where it cannot affect circuit routing.
               [(stmt->assert (car stmts)) =>
                (lambda (a)
                  (and (assert-cond-supported?
@@ -1780,6 +1826,9 @@
       ;; is a no-op rather than a compile error.
       (define (assert-cond-rust expr local-binds
                                 native-id-ht witness-id-ht circuit-id-ht)
+        ;; Task 2.4: an assert condition is Boolean; clear any inherited
+        ;; expression expectation so it cannot leak a destination type in.
+        (parameterize ([current-expr-expected-type #f])
         (let ([e (expr-strip-cast expr)])
           (nanopass-case (Ltypescript Expression) e
             [(call ,src ,function-name ,expr* ...)
@@ -1812,7 +1861,7 @@
                     (id-sym function-name))]))]
             [else
              (ctor-expr-rust e local-binds
-                             native-id-ht witness-id-ht circuit-id-ht)])))
+                             native-id-ht witness-id-ht circuit-id-ht)]))))
 
       ;; inline-circuit-call: attempt to inline a circuit invocation by
       ;; rendering the callee's body as a Rust expression with the
@@ -1959,6 +2008,44 @@
                   (emit-body-mutations (reverse writes) mode local-binds
                                        native-id-ht witness-id-ht circuit-id-ht
                                        witness-emitted?)])]
+              ;; Task 3.1: the typechecker's forward declaration for a
+              ;; `const` whose RHS lifted temps via `maybe-bind`
+              ;; (`(const src (local* ...))`, no initialiser). The eventual
+              ;; `(= ...)` assignment is rendered as the real `let`; the
+              ;; declaration itself carries no work. Mirroring the streaming
+              ;; walker, skip it so a constructor like
+              ;; `const diff = base - q * 4;` stays walkable.
+              [(const-decl-only? (car stmts))
+               (loop (cdr stmts) local-binds witness-emitted? pre-lines writes)]
+              ;; The lifted assignment matching a declaration-only `const`
+              ;; (task 3.1, mirroring the streaming walker): render it as a
+              ;; plain `let`, threading the new binding into local-binds so
+              ;; later statements resolve it. This is what makes a
+              ;; constructor whose guard assert lifted a temp — e.g.
+              ;; `assert(q * 4 <= y, ...)` lowering to
+              ;; `(seq (= %t (* ...)) (assert (<= %t ...)))` — walkable.
+              [(stmt->assignment (car stmts)) =>
+               (lambda (a)
+                 (let* ([var-name (car a)]
+                        [rhs (cdr a)]
+                        [proposed (symbol->string (camel->snake (id-sym var-name)))]
+                        [rust-name (uniquify-rust-name proposed local-binds)]
+                        [raw (guard (c [#t #f])
+                               (parameterize ([current-expr-expected-type
+                                               (expr-expected-type rhs)])
+                                 (ctor-expr-rust rhs local-binds
+                                                 native-id-ht witness-id-ht
+                                                 circuit-id-ht)))]
+                        [rendered (and raw (expr-rust-arg-cloned rhs raw))])
+                   (cond
+                     [(not rendered) #f]
+                     [else
+                      (loop (cdr stmts)
+                            (cons (cons var-name rust-name) local-binds)
+                            witness-emitted?
+                            (cons (format "        let ~a = ~a;\n" rust-name rendered)
+                                  pre-lines)
+                            writes)])))]
               ;; E4.3: a TERMINAL `public-ledger` call whose op-class is
               ;; not `write` (e.g. HistoricMerkleTree.insert). The vm-code
               ;; expansion path renders it via expand-vm-code +
@@ -2295,10 +2382,18 @@
                       ;; emit `let tmp = 42;` and fail to compile.
                       (let* ([decl-type (const-binding-decl-type (car stmts))]
                              [coerced (coerce-literal-rhs-rendered decl-type rhs)]
+                             ;; Non-literal RHS renders at the binding's
+                             ;; declared type (task 2.1): the typer wraps the
+                             ;; RHS in a `safe-cast` to it, so a Uint widening
+                             ;; / Uint->Field value materialises here. A
+                             ;; literal keeps the pre-existing `coerced` path
+                             ;; (byte-identical).
                              [raw
                               (or coerced
-                                  (ctor-expr-rust rhs local-binds
-                                                  native-id-ht witness-id-ht circuit-id-ht))]
+                                  (parameterize ([current-expr-expected-type
+                                                  (or decl-type (expr-expected-type rhs))])
+                                    (ctor-expr-rust rhs local-binds
+                                                    native-id-ht witness-id-ht circuit-id-ht)))]
                              ;; Bug-6: clone non-Copy var-ref / elt-ref RHS so
                              ;; the source struct/local stays usable after the
                              ;; lift. Skip the clone wrap when the coerced

@@ -380,8 +380,12 @@
                       [rust-name (symbol->string (camel->snake (id-sym var-name)))]
                       [raw
                        (guard (c [#t #f])
-                         (ctor-expr-rust rhs local-binds
-                                         native-id-ht witness-id-ht circuit-id-ht))]
+                         ;; Task 2.1 (assignment route): render at the RHS
+                         ;; wrapper's declared type so a bare literal /
+                         ;; widening materialises.
+                         (parameterize ([current-expr-expected-type (expr-expected-type rhs)])
+                           (ctor-expr-rust rhs local-binds
+                                           native-id-ht witness-id-ht circuit-id-ht)))]
                       ;; Bug-6: clone non-Copy var-ref / elt-ref RHS so the
                       ;; source struct/local stays usable after the lift.
                       [rendered
@@ -549,8 +553,14 @@
                    [else
                     (let* ([raw
                             (guard (c [#t #f])
-                              (ctor-expr-rust rhs local-binds
-                                              native-id-ht witness-id-ht circuit-id-ht))]
+                              ;; Task 2.1 (const-binding route): render at
+                              ;; the binding's declared type so a bare
+                              ;; literal / widening materialises.
+                              (parameterize ([current-expr-expected-type
+                                              (or (const-binding-decl-type (car stmts))
+                                                  (expr-expected-type rhs))])
+                                (ctor-expr-rust rhs local-binds
+                                                native-id-ht witness-id-ht circuit-id-ht)))]
                            ;; Bug-6: clone non-Copy var-ref / elt-ref RHS so
                            ;; the source struct/local stays usable after.
                            [rendered (and raw (expr-rust-arg-cloned rhs raw))])

@@ -8,7 +8,7 @@ The Rust code generation backend of the Compact compiler renders every expressio
 
 ### Requirement: Expressions are rendered against their expected type
 
-The Rust backend MUST render an expression using the Compact type required by its use position — the declared type of a `const` binding, the declared return type, the operand type of a comparison or arithmetic operation, the declared formal type of a call argument, the declared member type of a struct literal, the element type of a vector/array or native argument, and the destination field type of a ledger write. The typechecker's `(safe-cast <target> <src> expr)` wrapper MUST be materialised from `<target>`, not discarded.
+The Rust backend MUST render an expression using the Compact type required by its use position — the declared type of a `const` binding, the declared return type, the operand type of a comparison, the declared formal type of a call argument, the declared member type of a struct literal, the element type of a vector/array or native argument, and the destination field type of a ledger write. The typechecker's `(safe-cast <target> <src> expr)` wrapper MUST be materialised from `<target>`, not discarded.
 
 #### Scenario: Field-typed literal in a const binding
 - **WHEN** a circuit contains `const x: Field = 0;`

@@ -56,21 +56,25 @@ where
     pub fn initial_state(
         &self,
         ctx: ConstructorContext<PS>,
+        base: u32,
+        q: u32,
     ) -> Result<ConstructorResult<PS>, CompactError> {
-        let sv = new_array(vec![new_cell(false), new_cell_array([Fr::default(); 2])]);
+        let sv = new_array(vec![new_cell(0u32), new_cell(0u64)]);
         let state = ChargedState::new(sv);
         let qctx = QueryContext::new(state, midnight_compact_runtime::ContractAddress::default());
-        let tmp = [
-            midnight_compact_runtime::jubjub_point_x(midnight_compact_runtime::hash_to_curve(
-                Fr::from(1u64),
-            )),
-            midnight_compact_runtime::jubjub_point_y(midnight_compact_runtime::hash_to_curve(
-                Fr::from(1u64),
-            )),
-        ];
+        let diff = {
+            let t = ((q) as u64).wrapping_mul((4) as u64);
+            {
+                compact_assert!(
+                    (((base) as u64) >= t),
+                    "result of subtraction would be negative"
+                );
+                ((base) as u32).wrapping_sub((t) as u32)
+            }
+        };
         let ops = OpProgramVerify::<DefaultDB>::new()
-            .push(false, new_cell(1u8))
-            .push(true, new_cell_array(tmp.clone()))
+            .push(false, new_cell(0u8))
+            .push(true, new_cell(diff.clone()))
             .ins(false, 1)
             .build();
 
@@ -83,11 +87,49 @@ where
         })
     }
 
-    pub fn ping(&self, ctx: CircuitContext<PS>) -> Result<CircuitResults<PS, ()>, CompactError> {
+    pub fn record_pinned(
+        &self,
+        ctx: CircuitContext<PS>,
+        q: u32,
+        y: u32,
+    ) -> Result<CircuitResults<PS, ()>, CompactError> {
+        let _ = pure_circuits::assert_product_l_e(q, y)?;
+        let tmp = 1u16;
         let ops = OpProgramVerify::<DefaultDB>::new()
-            .push(false, new_cell(0u8))
-            .push(true, new_cell(true))
-            .ins(false, 1)
+            .idx_at_index(1u8, true)
+            .addi(tmp.clone() as u32)
+            .ins(true, 1)
+            .build();
+
+        let results = query_for_verify(
+            &ctx.current_query_context,
+            &ops,
+            ctx.gas_limit.clone(),
+            &ctx.cost_model,
+        )?;
+
+        Ok(CircuitResults {
+            result: (),
+            context: CircuitContext {
+                current_query_context: results.context,
+                ..ctx
+            },
+            gas_cost: results.gas_cost,
+        })
+    }
+
+    pub fn record_matching(
+        &self,
+        ctx: CircuitContext<PS>,
+        small: u8,
+        big: u32,
+    ) -> Result<CircuitResults<PS, ()>, CompactError> {
+        compact_assert!((((small) as u32) == big), "values must match across widths");
+        let tmp = 1u16;
+        let ops = OpProgramVerify::<DefaultDB>::new()
+            .idx_at_index(1u8, true)
+            .addi(tmp.clone() as u32)
+            .ins(true, 1)
             .build();
 
         let results = query_for_verify(
@@ -117,7 +159,7 @@ pub fn ledger<D: DB>(state: &ChargedState<D>) -> Ledger<'_, D> {
 }
 
 impl<'a, D: DB> Ledger<'a, D> {
-    pub fn flag(&self) -> Result<bool, CompactError> {
+    pub fn last_diff(&self) -> Result<u32, CompactError> {
         let qctx = QueryContext::new(
             self.state.clone(),
             midnight_compact_runtime::ContractAddress::default(),
@@ -137,9 +179,9 @@ impl<'a, D: DB> Ledger<'a, D> {
                 ))
             }
         };
-        midnight_compact_runtime::std_lib::decode_bool(av)
+        midnight_compact_runtime::std_lib::decode_u32(av)
     }
-    pub fn pt(&self) -> Result<[Fr; 2], CompactError> {
+    pub fn mixed_ops(&self) -> Result<u64, CompactError> {
         let qctx = QueryContext::new(
             self.state.clone(),
             midnight_compact_runtime::ContractAddress::default(),
@@ -159,8 +201,67 @@ impl<'a, D: DB> Ledger<'a, D> {
                 ))
             }
         };
-        midnight_compact_runtime::std_lib::decode_vector_fr::<2>(av)
+        midnight_compact_runtime::std_lib::decode_u64(av)
     }
 }
 
-pub mod pure_circuits {}
+pub mod pure_circuits {
+    use super::*;
+
+    pub fn assert_product_l_e(q: u32, y: u32) -> Result<(), CompactError> {
+        let t = ((q) as u64).wrapping_mul((4) as u64);
+        compact_assert!((t <= ((y) as u64)), "product must not exceed the bound");
+        Ok(())
+    }
+
+    pub fn assert_product_l_t(q: u32, y: u32) -> Result<(), CompactError> {
+        let t = ((q) as u64).wrapping_mul((4) as u64);
+        compact_assert!((t < ((y) as u64)), "product must stay below the bound");
+        Ok(())
+    }
+
+    pub fn assert_product_g_t(q: u32, y: u32) -> Result<(), CompactError> {
+        let t = ((q) as u64).wrapping_mul((4) as u64);
+        compact_assert!((t > ((y) as u64)), "product must exceed the bound");
+        Ok(())
+    }
+
+    pub fn assert_product_g_e(q: u32, y: u32) -> Result<(), CompactError> {
+        let t = ((q) as u64).wrapping_mul((4) as u64);
+        compact_assert!((t >= ((y) as u64)), "product must reach the bound");
+        Ok(())
+    }
+
+    pub fn assert_product_e_q(q: u32, y: u32) -> Result<(), CompactError> {
+        compact_assert!(
+            (((q) as u64).wrapping_mul((4) as u64) == ((y) as u64)),
+            "product must equal the bound"
+        );
+        Ok(())
+    }
+
+    pub fn assert_product_n_e(q: u32, y: u32) -> Result<(), CompactError> {
+        compact_assert!(
+            (((q) as u64).wrapping_mul((4) as u64) != ((y) as u64)),
+            "product must differ from the bound"
+        );
+        Ok(())
+    }
+
+    pub fn sum_mixed(q: u32, n: u8) -> Result<u64, CompactError> {
+        Ok(((q) as u64).wrapping_add((n) as u64))
+    }
+
+    pub fn product_mixed(q: u32, m: u8) -> Result<u64, CompactError> {
+        Ok(((q) as u64).wrapping_mul((m) as u64))
+    }
+
+    pub fn guarded_diff(y: u32, q: u32) -> Result<u32, CompactError> {
+        let t = ((q) as u64).wrapping_mul((4) as u64);
+        compact_assert!(
+            (((y) as u64) >= t),
+            "result of subtraction would be negative"
+        );
+        Ok(((y) as u32).wrapping_sub((t) as u32))
+    }
+}

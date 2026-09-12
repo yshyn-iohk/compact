@@ -76,10 +76,12 @@ grep -rn "(rust-feature-error" compiler/rust-passes*.ss \
   | grep -v "define (rust-feature-error" | wc -l
 ```
 
-At the time of writing that is **33 call sites** across 4 passes
-(`rust-passes-emit.ss` 27, `rust-passes-walker.ss` 4,
-`rust-passes-helpers.ss` 1, `rust-passes-prelude.ss` 1), spanning **27
-distinct kinds**.
+At the time of writing that is **38 call sites** across 4 passes
+(`rust-passes-emit.ss` 28, `rust-passes-walker.ss` 4,
+`rust-passes-helpers.ss` 5, `rust-passes-prelude.ss` 1), spanning **30
+distinct kinds**. (The `rust-passes-helpers.ss` count includes the
+post-emit `sentinel-splice` guard added by
+`type-directed-expression-coercion` — see below.)
 
 One caveat when reading a diagnostic: several emitters probe alternative
 shapes under a catch-all `(guard (c [#t #f]) …)`, which swallows a specific
@@ -195,6 +197,33 @@ new decoder arm plus a fixture.
 
 `map-mvp-shape`. `map()` is lowered for the shapes the fixtures cover
 (identity body, non-identity lambda, named function); other shapes reject.
+
+### `Uint` wider than `u128` into a `Field`
+
+`field-uint-coercion`. A `Uint<N>` value flowing into a `Field` position is
+zero-extended through the widest lossless Rust cast available — `Fr::from((x)
+as u64)`, then `Fr::from((x) as u128)` once the range passes `u64::MAX`. A
+source range that runs past `u128::MAX` (e.g. `Uint<248>`, Compact's maximum
+width) has no lossless cast into `Fr`, so it rejects rather than truncate:
+
+```compact
+ledger f: Field;
+constructor(x: Uint<248>) { f = disclose(x); }   // rejected (field-uint-coercion)
+```
+
+The `Uint<128>` boundary itself is accepted — its max is exactly `u128::MAX`,
+so `From<u128> for Fr` is lossless.
+
+### Sentinel splice
+
+`sentinel-splice`. The emitted `lib.rs` is buffered and scanned before it is
+written: a `#f` from a renderer that could not lower an expression — the
+value that used to reach the output when an unchecked caller fed it to
+`format` — aborts the compile with a location instead of producing Rust that
+merely looks plausible. The scan ignores `#f` inside string/char literals,
+comments, and raw identifiers (`r#foo`), so it only fires on an actual
+splice. This is the backstop that replaced the old reliance on the
+`rendered-has-todo?` `/* TODO` scan for correctness.
 
 ## Verifying a claim on this page
 

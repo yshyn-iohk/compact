@@ -1,0 +1,147 @@
+// This file is part of Compact.
+// Copyright (C) 2026 Midnight Foundation
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//  	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//
+// Type-directed coercion fixture: the value positions where a bare
+// literal (or a `Uint`-ranged value) had to be materialised at the
+// destination Compact type rather than left as an untyped Rust integer.
+//
+// Each circuit below isolates one of the newly-covered positions from
+// `type-directed-expression-coercion`:
+//   - `retFieldLiteral`   — return-tail literal (`Field`)
+//   - `constThenCall`     — `const x: Field = 0;` plus a pure-call arg
+//                           literal (`idf(0)`)
+//   - `structLiteral`     — struct Field-member literal (`Box { f: 0 }`)
+//   - `someFieldLiteral`  — `some<Field>(0)`
+//   - `hashZeroLiteral`   — `persistentHash([0])` (vector element literal)
+//   - `nativeArgLiteral`  — native-arg literal (`hashToCurve<Field>(0)`)
+//   - `uintToField`       — scalar `Uint<8>` → `Field` (`Fr::from((x) as u64)`)
+//   - `u128Rung`          — the wide `Uint<128>` rung
+//                           (`Fr::from((x) as u128)`, lossless)
+//   - `vectorEltWise`     — aggregate target: `[x, x]` into `Vector<2, Field>`
+//                           (element-wise coercion)
+// plus a constructor that writes Field / Uint<64> / `Vector<2, Field>`
+// ledger cells so the destination-typed write path is exercised and its
+// committed state can be compared byte-for-byte against the TS backend.
+
+import CompactStandardLibrary;
+
+struct Box {
+  f: Field;
+}
+
+export ledger fieldCell: Field;
+export ledger uintCell: Uint<64>;
+export ledger fieldVec: Vector<2, Field>;
+export ledger hashCell: Bytes<32>;
+export ledger pointCell: JubjubPoint;
+
+export pure circuit idf(x: Field): Field {
+  return x;
+}
+
+// Return-tail literal in a Field circuit.
+export pure circuit retFieldLiteral(): Field {
+  return 0;
+}
+
+// Field const literal, and a pure-circuit call argument literal.
+export pure circuit constThenCall(): Field {
+  const x: Field = 0;
+  return idf(0);
+}
+
+// Struct Field-member literal.
+export pure circuit structLiteral(): Box {
+  return Box { f: 0 };
+}
+
+// `some<Field>(0)`.
+export pure circuit someFieldLiteral(): Maybe<Field> {
+  return some<Field>(0);
+}
+
+// `persistentHash([0])` — a bare literal vector element feeding a native.
+export pure circuit hashZeroLiteral(): Bytes<32> {
+  return persistentHash<Vector<2, Field>>([0, 0]);
+}
+
+// Native-argument literal.
+export pure circuit nativeArgLiteral(): JubjubPoint {
+  return hashToCurve<Field>(0);
+}
+
+// Scalar Uint→Field coercion (u64 rung).
+export pure circuit uintToField(x: Uint<8>): Field {
+  return x as Field;
+}
+
+// The wide Uint<128> rung of the Uint→Field coercion.
+export pure circuit u128Rung(x: Uint<128>): Field {
+  return x as Field;
+}
+
+// Aggregate target: each Uint element is coerced to Field.
+export pure circuit vectorEltWise(x: Uint<32>): Vector<2, Field> {
+  return [x, x];
+}
+
+// Field literals above `u64::MAX`. Before type-directed coercion the
+// emitter hardcoded `Fr::from(<n>u64)`, so any Field literal past `u64::MAX`
+// emitted a `u64` literal that overflowed and failed `cargo build` while
+// `compactc` exited 0. The literal is now rendered at the Field width — the
+// `u128` rung up to `u128::MAX`, then the little-endian `Fr::from_le_bytes`
+// constructor for the `max-field` range above it. One circuit per
+// `field-literal-rust` call site (return tail reads both the u64 and the
+// larger rungs; the rest exercise the scalar and aggregate coercion sites).
+export pure circuit retU128FieldLiteral(): Field {
+  return (340282366920938463463374607431768211455 as Field);
+}
+
+export pure circuit retHugeFieldLiteral(): Field {
+  return (1606938044258990275541962092341162602522202993782792835301376 as Field);
+}
+
+export pure circuit constHugeFieldLiteral(): Field {
+  const x: Field = (1606938044258990275541962092341162602522202993782792835301376 as Field);
+  return x;
+}
+
+export pure circuit callArgHugeFieldLiteral(): Field {
+  return idf(1606938044258990275541962092341162602522202993782792835301376 as Field);
+}
+
+export pure circuit structMemberHugeFieldLiteral(): Box {
+  return Box { f: (1606938044258990275541962092341162602522202993782792835301376 as Field) };
+}
+
+export pure circuit vectorEltHugeFieldLiteral(): Vector<1, Field> {
+  return [(1606938044258990275541962092341162602522202993782792835301376 as Field)];
+}
+
+export pure circuit cmpHugeFieldLiteral(x: Field): Boolean {
+  return x == (1606938044258990275541962092341162602522202993782792835301376 as Field);
+}
+
+// Destination-typed ledger writes (the cell-write position). The hash and
+// curve-point writes put their coerced values into the committed state so
+// the executing test's byte-parity against the TS backend pins them too.
+constructor() {
+  fieldCell = 0;
+  uintCell = 0;
+  fieldVec = [0, 0];
+  hashCell = persistentHash<Vector<2, Field>>([0, 0]);
+  pointCell = hashToCurve<Field>(0);
+}

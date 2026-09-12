@@ -1,0 +1,144 @@
+// This file is part of Compact.
+// Copyright (C) 2026 Midnight Foundation
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//  	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//
+// Mixed-minimal-width operand fixture for the rust backend's
+// comparison/equality widening (`materialize-at-type` on the typer's
+// `safe-cast` wrapper — `expr-rust-typed` / `coerce-cmp-operand-rust`).
+//
+// Compact's typer tracks value RANGES, not declared widths: `q * 4` on
+// `q: Uint<32>` types as Uint<0..17179869180>, which the rust emitter
+// deliberately renders at u64 (range fidelity — it must NOT be narrowed
+// back to u32). When such a range-widened expression meets a
+// Uint<32>-ranged operand inside a comparison, the typer wraps the
+// narrower operand in `(safe-cast <joined-range> <own-range> ...)`; the
+// emitter materialises that wrapper as `(operand) as u64` so both sides
+// of the Rust comparison share one width. Before the fix the wrapper
+// was peeled silently and every such site failed `cargo build` with
+// E0308 — 13 errors in the digital-passport dogfood, all rooted in its
+// civil-date reconstruction.
+//
+// Coverage, one concern per circuit:
+//   - `assertProductLE/LT/GT/GE/EQ/NE`: each comparison operator with
+//     one range-widened operand (product `q * 4`, u64) against a
+//     narrow binding (`y`, u32). Both directions matter: the pass side
+//     of GT/GE/EQ/NE and the fail side of LE/LT pin values at and past
+//     the 2^32 boundary, so a truncating or wrongly-directed cast
+//     cannot pass by merely compiling (the executing test drives them).
+//   - `sumMixed` / `productMixed`: range-widened `+` and `*` whose
+//     operands mix minimal widths (u32-side vs u8-side), returning the
+//     u64-rendered result.
+//   - `guardedDiff`: `y - q * 4` — the guarded-subtraction route; the
+//     subtraction itself renders same-width via the typer's mbits, and
+//     the underflow guard widens `y` to meet the product.
+//   - `recordPinned` (impure): calls the mixed-width ordering assert and
+//     writes a ledger — impure bodies gate through `expr-supported?`,
+//     which admits no ordering comparisons inline, so the impure route
+//     forwards to the pure callee (the `recordFreshEnough` shape).
+//   - `recordMatching` (impure): an INLINE mixed-width equality
+//     (`small == big`, u8 vs u32) — equality IS admissible in impure
+//     bodies and exercises the ctor-path widening in
+//     coerce-cmp-operand-rust rather than expr-rust's clauses.
+//   - the constructor: a mixed-width guarded subtraction as the const
+//     feeding the initial ledger value, pinning the constructor body
+//     route (including its underflow guard comparison).
+//
+// Ported from the `mixed_width_operand_fixture` in
+// `feature/add-digital-passport-dogfood-fixture` (PR #70), minus its
+// `assertQuotientPinned` circuit: that shape needs ternary-EXPRESSION
+// support, which belongs to the sibling `fix-ternary-expression-codegen`
+// change (this change only WIRES the coercion boundaries).
+//
+// `widening_arith_fixture` covers the mbits ladder of `+ - *` at
+// uniform declared widths; this fixture covers the boundaries where
+// operands of one binary operation have DIFFERENT minimal Rust widths.
+
+import CompactStandardLibrary;
+
+export ledger lastDiff: Uint<32>;
+export ledger mixedOps: Counter;
+
+// Constructor route: mixed-width guarded subtraction as the initial
+// value. `q * 4` ranges to u64; the guard widens `base` to compare
+// against it; the subtraction result stays Uint<32>-ranged.
+constructor(base: Uint<32>, q: Uint<32>) {
+  const diff = base - q * 4;
+  lastDiff = disclose(diff);
+}
+
+// One comparison operator per circuit, widened product on the left,
+// narrow binding on the right. All six share the shape
+// `q * 4 <op> y` with `q, y: Uint<32>` — the product's minimal Rust
+// width is u64, `y`'s is u32.
+export pure circuit assertProductLE(q: Uint<32>, y: Uint<32>): [] {
+  assert(q * 4 <= y, "product must not exceed the bound");
+}
+
+export pure circuit assertProductLT(q: Uint<32>, y: Uint<32>): [] {
+  assert(q * 4 < y, "product must stay below the bound");
+}
+
+export pure circuit assertProductGT(q: Uint<32>, y: Uint<32>): [] {
+  assert(q * 4 > y, "product must exceed the bound");
+}
+
+export pure circuit assertProductGE(q: Uint<32>, y: Uint<32>): [] {
+  assert(q * 4 >= y, "product must reach the bound");
+}
+
+export pure circuit assertProductEQ(q: Uint<32>, y: Uint<32>): [] {
+  assert(q * 4 == y, "product must equal the bound");
+}
+
+export pure circuit assertProductNE(q: Uint<32>, y: Uint<32>): [] {
+  assert(q * 4 != y, "product must differ from the bound");
+}
+
+// Range-widened `+` across mixed minimal widths: the u32 side and the
+// u8 side both render at the u64 result width; the returning value
+// exceeds 2^32 for wide inputs (the executing test pins the exact
+// bytes so a truncating cast cannot hide).
+export pure circuit sumMixed(q: Uint<32>, n: Uint<8>): Uint<64> {
+  return q + n;
+}
+
+// Range-widened `*` across mixed minimal widths (u32 * u8 -> u64).
+export pure circuit productMixed(q: Uint<32>, m: Uint<8>): Uint<64> {
+  return q * m;
+}
+
+// The guarded-subtraction route with a range-widened subtrahend: the
+// guard comparison widens `y` to the product's u64 width before the
+// same-width `wrapping_sub` produces the Uint<32>-ranged difference.
+export pure circuit guardedDiff(y: Uint<32>, q: Uint<32>): Uint<32> {
+  return y - q * 4;
+}
+
+// Impure route over a mixed-width ordering assert: the pure callee
+// carries it (impure bodies' walkability gate admits no ordering
+// comparisons inline), and a ledger write makes the circuit reachable
+// from an executing test on both Ok and Err sides.
+export circuit recordPinned(q: Uint<32>, y: Uint<32>): [] {
+  assertProductLE(q, y);
+  mixedOps.increment(1);
+}
+
+// Impure INLINE mixed-width equality: `small` is Uint<8>, `big` is
+// Uint<32>, so the equality's joined type widens `small`; this is the
+// coerce-cmp-operand-rust (ctor-path) twin of the pure circuits above.
+export circuit recordMatching(small: Uint<8>, big: Uint<32>): [] {
+  assert(small == big, "values must match across widths");
+  mixedOps.increment(1);
+}
